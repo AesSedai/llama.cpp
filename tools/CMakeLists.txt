@@ -10,6 +10,10 @@ find_package(Threads REQUIRED)
 
 llama_add_compile_flags()
 
+# options
+
+option(LLAMA_BUILD_ANALYZE_QUANT "Build llama-analyze-quant tool" ON)
+
 # tools
 
 if (EMSCRIPTEN)
