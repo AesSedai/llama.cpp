@@ -779,6 +779,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
     struct type_choice {
         const llama_model_loader::llama_tensor_weight * w = nullptr;
         std::vector<type_scores> candidates;
+        std::vector<type_scores> raw_candidates; // every evaluated type, before the hull; what the state file stores
         int choice = -1;
         float min_bpw = 0.0;
         float max_bpw = 0.0;
@@ -813,7 +814,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
 
     constexpr double EPSILON = 1e-12;
     constexpr double INFINITE = std::numeric_limits<double>::infinity();
-    constexpr uint64_t STATE_MAGIC = 0x4250572d5632; // "BPW-V2"
+    constexpr uint64_t STATE_MAGIC = 0x4250572d5633; // "BPW-V3": candidates stored before the hull
     constexpr uint64_t HASH_MAGIC = 0xeabada55cafed00d;
     constexpr float ffn_down_boost = 6.0f;
     constexpr float output_boost = 3.0f;
@@ -945,7 +946,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
             ofs.write((const char *)& len, sizeof(len));
             ofs.write(name.data(), len);
 
-            const uint64_t sz = tn.candidates.size();
+            const uint64_t sz = tn.raw_candidates.size();
             ofs.write((const char *)& sz, sizeof(sz));
             ofs.write((const char *)& tn.choice, sizeof(tn.choice));
             ofs.write((const char *)& tn.min_bpw, sizeof(tn.min_bpw));
@@ -953,7 +954,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
             const uint64_t ne = tn.n_elements;
             ofs.write((const char *)& ne, sizeof(ne));
 
-            for (const auto & c : tn.candidates) {
+            for (const auto & c : tn.raw_candidates) {
                 const int32_t tp = c.type;
                 const uint64_t bt = c.bytes;
                 ofs.write((const char *)& tp, sizeof(tp));
@@ -1830,6 +1831,38 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
     const int n_workers = std::max(1, std::min(nthread, (int) tensors.size()));
     const size_t max_buf_worker = std::max<size_t>(1, (qs.params->max_buf_size ? qs.params->max_buf_size : LLAMA_QUANT_MAX_BUF_SIZE) / n_workers);
 
+    // Keep the lower convex hull of (bytes, error)
+    auto simplify_pareto = [&](std::vector<type_scores> & candidates) {
+        std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+            return a.bytes < b.bytes || (a.bytes == b.bytes && (a.error < b.error || (a.error == b.error && a.type < b.type)));
+        });
+        candidates.erase(std::unique(candidates.begin(), candidates.end(),
+            [](const auto & a, const auto &b) { return a.bytes == b.bytes; }), candidates.end());
+
+        std::vector<type_scores> hull;
+        double min_err = INFINITE;
+        for(const auto & c : candidates) {
+            if (c.error < min_err) {
+                min_err = c.error;
+                hull.push_back(c);
+            }
+        }
+        candidates = std::move(hull);
+
+        if (candidates.size() < 3) { return; }
+        std::vector<type_scores> convex;
+        auto cross = [](const auto& a, const auto& b, const auto& c) {
+            return ((double)b.bytes - (double)a.bytes) * (c.error - a.error) - ((double)c.bytes - (double)a.bytes) * (b.error - a.error);
+        };
+
+        for (const auto & c : candidates) {
+            while (convex.size() >= 2 && cross(convex[convex.size()-2], convex.back(), c) <= EPSILON) { convex.pop_back(); }
+            convex.push_back(c);
+        }
+
+        candidates = std::move(convex);
+    };
+
     auto process_tensor = [&](
         const llama_model_loader::llama_tensor_weight * tw,
         std::vector<no_init<uint8_t>> & thread_local_buffer,
@@ -1857,10 +1890,8 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
         if (auto tn = bpw_data.find(name); tn != bpw_data.end()) {
             type_choice tc;
             tc.w = tw;
-            tc.candidates = tn->second.candidates;
-            tc.choice = tn->second.choice;
-            tc.min_bpw = tn->second.min_bpw;
-            tc.max_bpw = tn->second.max_bpw;
+            tc.raw_candidates = tn->second.candidates;
+            tc.candidates = tc.raw_candidates;
             tc.n_elements = tn->second.n_elements ? tn->second.n_elements : (size_t)ggml_nelements(tensor);
             // remove ignored types
             if (qs.has_ignored_types) {
@@ -1881,10 +1912,13 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
                     fb.bpw = fb.bytes * 8.0f / tc.n_elements;
                     tc.candidates.push_back(fb);
                 }
-
-                tc.choice = 0;
             }
 
+            // the hull depends on which types are allowed, so it is rebuilt on every run
+            simplify_pareto(tc.candidates);
+            tc.choice = 0;
+            tc.min_bpw = tc.candidates.front().bpw;
+            tc.max_bpw = tc.candidates.back().bpw;
             return tc;
         }
 
@@ -2208,37 +2242,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
             ch.candidates.push_back(fb);
         }
 
-        auto simplify_pareto = [&](std::vector<type_scores> & candidates) {
-            std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
-                return a.bytes < b.bytes || (a.bytes == b.bytes && (a.error < b.error || (a.error == b.error && a.type < b.type)));
-            });
-            candidates.erase(std::unique(candidates.begin(), candidates.end(),
-                [](const auto & a, const auto &b) { return a.bytes == b.bytes; }), candidates.end());
-
-            std::vector<type_scores> hull;
-            double min_err = INFINITE;
-            for(const auto & c : candidates) {
-                if (c.error < min_err) {
-                    min_err = c.error;
-                    hull.push_back(c);
-                }
-            }
-            candidates = std::move(hull);
-
-            if (candidates.size() < 3) { return; }
-            std::vector<type_scores> convex;
-            auto cross = [](const auto& a, const auto& b, const auto& c) {
-                return ((double)b.bytes - (double)a.bytes) * (c.error - a.error) - ((double)c.bytes - (double)a.bytes) * (b.error - a.error);
-            };
-
-            for (const auto & c : candidates) {
-                while (convex.size() >= 2 && cross(convex[convex.size()-2], convex.back(), c) <= EPSILON) { convex.pop_back(); }
-                convex.push_back(c);
-            }
-
-            candidates = std::move(convex);
-        };
-
+        ch.raw_candidates = ch.candidates;
         simplify_pareto(ch.candidates);
         ch.choice = 0;
         ch.min_bpw = ch.candidates.front().bpw;
@@ -2331,7 +2335,16 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
                 }
 
                 if (idx == -1) {
-                    // Pinned type was pareto-pruned or not evaluated; add with unknown error
+                    // pruned from the hull but evaluated: keep its measured error
+                    const auto rc = std::find_if(tn.raw_candidates.begin(), tn.raw_candidates.end(), [&](const type_scores & c) { return c.type == mc; });
+                    if (rc != tn.raw_candidates.end()) {
+                        tn.candidates.push_back(*rc);
+                        idx = (int)tn.candidates.size() - 1;
+                    }
+                }
+
+                if (idx == -1) {
+                    // Pinned type was not evaluated; add with unknown error
                     type_scores ts;
                     ts.type = mc;
                     ts.bpw = (float)tensor_bpw(tn.w->tensor, mc);
