@@ -71,6 +71,7 @@ Advanced options:
 * `--target-size` automatically choose quant types to meet a file size target
 * `--state-file` file name to use or save to the bpw/size error computations; if no name is provided it defaults to `<model name>-<model hash>.bpw_state`
 * `--target-exclude` comma-separated list of quant types (names or ordinals) that automatic quant type selection must ignore; for use with `--target-bpw`/`--target-size`. May be specified multiple times. A state checkpoint is not written while this option is active
+* `--target-tie-experts` for use with `--target-bpw`/`--target-size`: in each layer, `ffn_gate_exps` and `ffn_up_exps` get the same type and `ffn_down_exps` a type one bit-class higher (1-bit IQ1_*, 2-bit IQ2_*/Q2_K, 3-bit IQ3_*/Q3_K, then 4, 5, 6, 8 and 16 bits). The three tensors are allocated as one unit, and the expert down-projection cap is not applied
 
 ## (Optional) Convert the multimodal components
 

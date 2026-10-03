@@ -110,7 +110,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file] [--prune-layers]\n");
-    printf("       [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size] [--target-bpw] [--target-size] [--target-exclude] [--state-file]\n");
+    printf("       [--keep-split] [--override-kv] [--dry-run] [--max-buffer-size] [--target-bpw] [--target-size] [--target-exclude] [--target-tie-experts] [--state-file]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -165,6 +165,9 @@ static void usage(const char * executable) {
     printf("  --target-exclude type[,type...]\n");
     printf("                                      comma-separated ggml_type (names or ordinals) that automatic quant type selection must ignore\n");
     printf("                                      advanced option for --target-bpw/--target-size; may be specified multiple times\n\n");
+    printf("  --target-tie-experts\n");
+    printf("                                      per layer, give the routed ffn_gate_exps and ffn_up_exps the same type and ffn_down_exps a type one bit-class higher\n");
+    printf("                                      advanced option for --target-bpw/--target-size\n\n");
     printf("note: --include-weights and --exclude-weights cannot be used together\n");
     printf("      --target-bpw and --target-size cannot be used together\n");
     printf("      --exclude-weights excludes tensor NAMES, while --target-exclude excludes quant TYPES\n\n");
@@ -627,6 +630,8 @@ int llama_quantize(int argc, char ** argv) {
             if (arg_idx == argc-1 || !parse_target_size(argv[++arg_idx], target_size)) {
                 usage(argv[0]);
             }
+        } else if (strcmp(argv[arg_idx], "--target-tie-experts") == 0) {
+            params.target_tie_experts = true;
         } else if (strcmp(argv[arg_idx], "--target-exclude") == 0) {
             if (arg_idx == argc-1 || !parse_target_exclude(argv[++arg_idx], target_exclude)) {
                 usage(argv[0]);

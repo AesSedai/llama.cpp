@@ -10,6 +10,7 @@
 #include <cinttypes>
 #include <csignal>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -773,6 +774,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
         double error = 0.0;
         double mse = 0.0;
         double wce = 0.0;
+        ggml_type tied_type = GGML_TYPE_COUNT; // tied expert unit: the gate/up type, while `type` is the down type
     };
 
     // Tensor quantization type choice
@@ -785,6 +787,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
         float max_bpw = 0.0;
         size_t n_elements = 0;
         float boost = 1.0f;
+        int tie_group = -1; // index into tied_members when this entry is a tied expert unit
     };
 
     // Quantization types
@@ -2364,6 +2367,159 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
         all_tensors = std::move(variable_tensors);
     }
 
+    // Tie each layer's routed experts: gate and up share one type and down sits one bit-class above it.
+    // The three tensors become one auction unit whose candidates are the allowed (gate/up, down) pairs.
+    std::vector<std::array<type_choice, 3>> tied_members; // gate, up, down of each unit
+    if (qs.params->target_tie_experts) {
+        auto bit_class = [](const ggml_type t) -> int {
+            switch (t) {
+                case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_M:
+                    return 1;
+                case GGML_TYPE_IQ2_XXS:
+                case GGML_TYPE_IQ2_XS:
+                case GGML_TYPE_IQ2_S:
+                case GGML_TYPE_Q2_K:
+                    return 2;
+                case GGML_TYPE_IQ3_XXS:
+                case GGML_TYPE_IQ3_S:
+                case GGML_TYPE_Q3_K:
+                    return 3;
+                case GGML_TYPE_IQ4_XS:
+                case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_MXFP4:
+                    return 4;
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q5_K:
+                    return 5;
+                case GGML_TYPE_Q6_K:
+                    return 6;
+                case GGML_TYPE_Q8_0:
+                    return 8;
+                case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:
+                    return 16;
+                default:
+                    return -1;
+            }
+        };
+        auto next_class = [](const int c) -> int {
+            constexpr int ladder[] = { 1, 2, 3, 4, 5, 6, 8, 16 };
+            for (size_t i = 0; i + 1 < std::size(ladder); ++i) {
+                if (ladder[i] == c) { return ladder[i + 1]; }
+            }
+            return -1;
+        };
+        // a member may take any evaluated type that --target-exclude allows; the per-tensor hull is not used here
+        auto allowed = [&](const type_choice & tc) {
+            std::vector<type_scores> out;
+            for (const auto & c : tc.raw_candidates) {
+                if (c.type >= 0 && c.type < GGML_TYPE_COUNT && qs.ignored_types[c.type]) { continue; }
+                out.push_back(c);
+            }
+            return out;
+        };
+
+        const std::regex expert_re("blk\\.([0-9]+)\\.ffn_(gate|up|down)_exps\\.weight");
+        std::map<int, std::array<int, 3>> layers;
+        for (size_t i = 0; i < all_tensors.size(); ++i) {
+            const std::string name = ggml_get_name(all_tensors[i].w->tensor);
+            std::smatch m;
+            if (!std::regex_match(name, m, expert_re)) { continue; }
+            auto & slot = layers.try_emplace(std::stoi(m[1].str()), std::array<int, 3>{ -1, -1, -1 }).first->second;
+            slot[m[2] == "gate" ? 0 : m[2] == "up" ? 1 : 2] = (int)i;
+        }
+
+        std::vector<bool> absorbed(all_tensors.size(), false);
+        std::vector<type_choice> units;
+        for (const auto & [layer, idx] : layers) {
+            if (idx[0] < 0 || idx[1] < 0 || idx[2] < 0) { continue; } // a member is pinned by --tensor-type
+            const auto gate = allowed(all_tensors[idx[0]]);
+            const auto up   = allowed(all_tensors[idx[1]]);
+            const auto down = allowed(all_tensors[idx[2]]);
+
+            type_choice unit;
+            unit.w = all_tensors[idx[2]].w;
+            unit.n_elements = all_tensors[idx[0]].n_elements + all_tensors[idx[1]].n_elements + all_tensors[idx[2]].n_elements;
+            for (const auto & g : gate) {
+                const auto u = std::find_if(up.begin(), up.end(), [&](const type_scores & c) { return c.type == g.type; });
+                if (u == up.end()) { continue; }
+                const int dc = next_class(bit_class(g.type));
+                // all three left in the source format (e.g. MXFP4 experts) is lossless, so no class step is needed there
+                const bool g_src = g.type == all_tensors[idx[0]].w->tensor->type;
+                const ggml_type d_src = all_tensors[idx[2]].w->tensor->type;
+                for (const auto & d : down) {
+                    const bool keep_src = g_src && d.type == d_src;
+                    if ((dc < 0 || bit_class(d.type) != dc) && !keep_src) { continue; }
+                    type_scores pair;
+                    pair.type = d.type;
+                    pair.tied_type = g.type;
+                    pair.bytes = g.bytes + u->bytes + d.bytes;
+                    pair.error = g.error + u->error + d.error;
+                    pair.bpw = (float)((double)pair.bytes * 8.0 / (double)unit.n_elements);
+                    unit.candidates.push_back(pair);
+                }
+            }
+
+            if (unit.candidates.empty()) {
+                LLAMA_LOG_WARN("\t%s: layer %d has no gate/up/down type pair one bit-class apart; its experts stay independent\n", func, layer);
+                continue;
+            }
+
+            simplify_pareto(unit.candidates);
+            unit.choice = 0;
+            unit.min_bpw = unit.candidates.front().bpw;
+            unit.max_bpw = unit.candidates.back().bpw;
+            unit.tie_group = (int)tied_members.size();
+            tied_members.push_back({ std::move(all_tensors[idx[0]]), std::move(all_tensors[idx[1]]), std::move(all_tensors[idx[2]]) });
+            for (const int i : idx) { absorbed[i] = true; }
+            units.push_back(std::move(unit));
+        }
+
+        if (!units.empty()) {
+            std::vector<type_choice> rest;
+            rest.reserve(all_tensors.size() - 2 * units.size());
+            for (size_t i = 0; i < all_tensors.size(); ++i) {
+                if (!absorbed[i]) { rest.push_back(std::move(all_tensors[i])); }
+            }
+            for (auto & u : units) { rest.push_back(std::move(u)); }
+            all_tensors = std::move(rest);
+            LLAMA_LOG_INFO("%s: tying routed experts in %zu layers (gate = up, down one bit-class higher)\n", func, tied_members.size());
+        }
+    }
+
+    // Split tied units back into their three tensors, each fixed at the type its pair chose
+    auto expand_tied = [&]() {
+        if (tied_members.empty()) { return; }
+        std::vector<type_choice> out;
+        out.reserve(all_tensors.size() + 2 * tied_members.size());
+        for (auto & tn : all_tensors) {
+            if (tn.tie_group < 0) {
+                out.push_back(std::move(tn));
+                continue;
+            }
+
+            const type_scores pick = tn.candidates[tn.choice];
+            auto & members = tied_members[tn.tie_group];
+            for (int k = 0; k < 3; ++k) {
+                type_choice m = std::move(members[k]);
+                const ggml_type want = k < 2 ? pick.tied_type : pick.type;
+                const auto c = std::find_if(m.raw_candidates.begin(), m.raw_candidates.end(), [&](const type_scores & s) { return s.type == want; });
+                GGML_ASSERT(c != m.raw_candidates.end());
+                m.candidates = { *c };
+                m.choice = 0;
+                out.push_back(std::move(m));
+            }
+        }
+
+        all_tensors = std::move(out);
+        tied_members.clear();
+    };
+
     size_t pinned_bytes = 0;
     for (const auto & tc : pinned_tensors) { pinned_bytes += tc.candidates[tc.choice].bytes; }
 
@@ -2408,6 +2564,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
 
     // Get the types' override
     auto build_mix = [&]() -> std::unordered_map<std::string, ggml_type> {
+        expand_tied();
         std::unordered_map<std::string, ggml_type> quant_mix;
         std::unordered_map<std::string, const type_choice *> optimized;
         std::unordered_map<std::string, const type_choice *> pinned;
@@ -2736,7 +2893,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
     }
 
     // Expert down-projection cap
-    if (global_bpw < boost_taper) {
+    if (global_bpw < boost_taper && tied_members.empty()) {
         const std::regex expert_ffn_down("blk\\.[0-9]+\\.ffn_down_exps\\.weight");
         const std::regex expert_ffn_gate("blk\\.[0-9]+\\.ffn_gate_exps\\.weight");
         const std::regex expert_ffn_up  ("blk\\.[0-9]+\\.ffn_up_exps\\.weight");
@@ -3466,7 +3623,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.target_bpw                  =*/ -1.0f,
         /*.target_size                 =*/ -1,
         /*.state_file                  =*/ nullptr,
-        /*.target_exclude              =*/ nullptr
+        /*.target_exclude              =*/ nullptr,
+        /*.target_tie_experts          =*/ false,
     };
 
     return result;

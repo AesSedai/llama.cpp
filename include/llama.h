@@ -458,6 +458,7 @@ extern "C" {
         int64_t target_size;                                        // target file size in bytes
         const char * state_file;                                    // pointer to bpw state file
         const enum ggml_type * target_exclude;                      // pointer to excluded GGML_TYPEs
+        bool target_tie_experts;                                    // routed experts per layer: gate = up, down one bit-class higher
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
